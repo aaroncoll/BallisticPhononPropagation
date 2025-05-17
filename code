@@ -1,0 +1,684 @@
+# IMPORT FUNCTIONS
+from scipy.interpolate import CubicSpline
+import numpy as np
+import matplotlib.pyplot as plt
+from numpy.linalg import eig
+from scipy.interpolate import RectBivariateSpline
+from matplotlib.animation import FuncAnimation
+from scipy import integrate, interpolate
+import scipy.constants as const
+
+# PARAMETERS TO DEFINE
+
+# Crystal Parameters
+c11 = 128.89e9 # GPa
+c12 = 48.33e9
+c44 = 67.10e9
+rho = 5323 # [g/cm^3]
+
+# GROUP VELOCITY INITIALIZATION PARAMETERS
+n_phi=720 # density of phi points (angle between x and y)
+n_theta=21 # density of theta points (angle between z and xy)
+N=21 # density of points for derivative calculation, MUST be odd or 0 won't be in dk
+phi0, phi1 = 0, 2 * np.pi
+theta0, theta1 = 0, np.pi
+
+
+# SIMULATION PARAMETERS
+time_start = 5e-7   # start time [s], must be greater than 0
+time_end = 5e-5     # end time [s]
+cube = [0.05, 0.05, 0.05]   # defines x, y, z dimensions of the cube [m]
+sensors = np.array([[0, cube[1], 0, 0.01, 0, 0.05]])
+num_particles_ = 1000 # number of particles
+num_frames = 100 # number of frames in the animation
+originx, originy, originz = 0, 0, 0 # origin of the outgoing phonons [m]
+
+angle_offsets = (-np.pi/4, 0)
+mode_percentages = [0.53, 0.36, 0.098] # ST, FT, L
+
+
+######################### FUNCTIONS FOR INITIALIZATION OF GROUP VELOCITIES ########################################################################
+
+def christoffel_tensor(kx, ky, kz):
+    """
+    Calculate the Christoffel tensor for a given wave vector k.
+    Parameters:
+    kx, ky, kz: components of the wave vector k
+    Returns:
+    D: the Christoffel tensor (3x3 matrix)
+    """
+    k = np.array([kx, ky, kz])
+    k = k / np.linalg.norm(k)
+    D = np.zeros((3,3))
+    for i in range(3):
+        for j in range(3):
+            D[i,j] = (
+                c11 * k[i] * k[j] * (i == j)
+                + c12 * k[i] * k[j] * (i != j)
+                + c44 * (np.sum(k**2) - k[i]**2) * (i == j)
+                + c44 * k[i] * k[j] * (i != j)
+            )
+    return D / rho
+
+def calcomega(kx,ky,kz):
+    """
+    Calculate the angular frequencies for a given wave vector k.
+    Parameters:
+    kx, ky, kz: components of the wave vector k
+    Returns:
+    omegaST, omegaFT, omegaL: angular frequencies for the three modes
+    """
+    D = christoffel_tensor(kx, ky, kz)
+    eigvals, eigvecs = eig(D)
+    sorted_indices = np.argsort(eigvals)    # EIGENVALUES ARE ORDERED AS ST, FT, L ONCE SORTED
+    eigvals = eigvals[sorted_indices]
+    v_phase = np.sqrt(eigvals)
+    kmag = np.linalg.norm(np.array([kx,ky,kz]))
+    omegaST = kmag * v_phase[0]
+    omegaFT = kmag * v_phase[1]
+    omegaL = kmag * v_phase[2]
+    return omegaST, omegaFT, omegaL
+
+####################### OTHER FUNCTIONS #################################################################################################
+
+def calcVg(k, modes, angle_offsets):
+    
+    kx, ky, kz = k[:, 0], k[:, 1], k[:, 2]
+
+    phi = np.arctan2(ky, kx) % (2 * np.pi)
+    k_magnitude = np.sqrt(kx**2 + ky**2 + kz**2)
+    theta = np.arccos(kz / k_magnitude)
+
+    Vg = np.zeros_like(k)
+
+    ST = (modes == 0)
+    if np.any(ST):
+        Vg[ST] = np.column_stack([
+            Vgx_splineST(phi[ST], theta[ST], grid=False),
+            Vgy_splineST(phi[ST], theta[ST], grid=False),
+            Vgz_splineST(phi[ST], theta[ST], grid=False)
+        ])
+
+    FT = (modes == 1)
+    if np.any(FT):
+        Vg[FT] = np.column_stack([
+            Vgx_splineFT(phi[FT], theta[FT], grid=False),
+            Vgy_splineFT(phi[FT], theta[FT], grid=False),
+            Vgz_splineFT(phi[FT], theta[FT], grid=False)
+        ])
+
+    L = (modes == 2)
+    if np.any(L):
+        Vg[L] = np.column_stack([
+            Vgx_splineL(phi[L], theta[L], grid=False),
+            Vgy_splineL(phi[L], theta[L], grid=False),
+            Vgz_splineL(phi[L], theta[L], grid=False)
+        ])
+    Vg = rotate_vectors(Vg, angle_offsets)
+    return Vg
+
+
+
+def calcposition(t,origin,Vg,modes):
+    r = origin + Vg * t[:, np.newaxis]
+    return r
+
+def onsensor(r_int, sensors):
+    on_sensor = np.zeros(len(r_int[:,0]), dtype=bool)
+    which_sensor = np.zeros_like(r_int[:,0], dtype = int)
+    for sensor_index,sensor in enumerate(sensors):
+        x_c, y_c, z_c, dx, dy, dz = sensor
+
+        if dx == 0:
+            y_min, y_max = y_c - dy / 2, y_c + dy / 2
+            z_min, z_max = z_c - dz / 2, z_c + dz / 2
+            in_x = (np.sign(r_int[:, 0]) == np.sign(x_c))
+            in_y = ((r_int[:, 1]) >= y_min) & ((r_int[:, 1]) <= y_max)
+            in_z = ((r_int[:, 2]) >= z_min) & ((r_int[:, 2]) <= z_max)
+            detected = in_x & in_y & in_z
+            on_sensor |= detected
+            which_sensor[detected] = sensor_index
+
+        elif dy == 0:
+            x_min, x_max = x_c - dx / 2, x_c + dx / 2
+            z_min, z_max = z_c - dz / 2, z_c + dz / 2
+            in_x = ((r_int[:, 0]) >= x_min) & ((r_int[:, 0]) <= x_max)
+            in_y = (np.sign(r_int[:, 1]) == np.sign(y_c))
+            in_z = ((r_int[:, 2]) >= z_min) & ((r_int[:, 2]) <= z_max)
+            detected = in_x & in_y & in_z
+            on_sensor |= detected
+            which_sensor[detected] = sensor_index
+
+        elif dz == 0:
+            x_min, x_max = x_c - dx / 2, x_c + dx / 2
+            y_min, y_max = y_c - dy / 2, y_c + dy / 2
+            in_x = ((r_int[:, 0]) >= x_min) & ((r_int[:, 0]) <= x_max)
+            in_y = ((r_int[:, 1]) >= y_min) & ((r_int[:, 1]) <= y_max)
+            in_z = (np.sign(r_int[:, 2]) == np.sign(z_c))
+            detected = in_x & in_y & in_z
+            on_sensor |= detected
+            which_sensor[detected] = sensor_index
+
+    return on_sensor, which_sensor
+
+
+def isabsorbed(t_int, r_int, cube, sensors):
+    hits_sensor, which_sensor_hit = onsensor(r_int, sensors)
+
+    absorbed = hits_sensor  # Can add in an absorbtion rate here
+    which_sensor_absorbed = which_sensor_hit[absorbed]
+
+    return absorbed, which_sensor_absorbed
+
+
+
+def wall_intercept(cube, origin, Vg, sensor, modes):
+    Vgx, Vgy, Vgz = Vg[:, 0], Vg[:, 1], Vg[:, 2]
+    x_wall = np.where(Vgx > 0, cube[0], -cube[0])
+    y_wall = np.where(Vgy > 0, cube[1], -cube[1])
+    z_wall = np.where(Vgz > 0, cube[2], -cube[2])
+    
+    tx = np.abs((x_wall - origin[:,0]) / Vgx)
+    ty = np.abs((y_wall - origin[:,1]) / Vgy)
+    tz = np.abs((z_wall - origin[:,2]) / Vgz)
+    
+    t_intercept = np.minimum(np.minimum(tx, ty), tz)
+    r_intercept = calcposition(t_intercept, origin, Vg, modes)
+
+    absorbed, which_sensor_absorbed = isabsorbed(t_intercept, r_intercept, cube, sensors)
+
+    return t_intercept, r_intercept, absorbed, which_sensor_absorbed
+
+def calcposition_after_reflection(cube, r_int, t_sum, t, Vg, modes):
+
+    Vg[:, 0] = np.where(np.abs(np.abs(r_int[:, 0]) - cube[0]) < 1e-15, -Vg[:, 0], Vg[:, 0])
+    Vg[:, 1] = np.where(np.abs(np.abs(r_int[:, 1]) - cube[1]) < 1e-15, -Vg[:, 1], Vg[:, 1])
+    Vg[:, 2] = np.where(np.abs(np.abs(r_int[:, 2]) - cube[2]) < 1e-15, -Vg[:, 2], Vg[:, 2])
+
+    r_after_reflection = calcposition(t - t_sum, r_int, Vg, modes)
+    return r_after_reflection, Vg
+
+def isreflecting(r, cube):
+    return np.any(np.abs(r) >= cube, axis=1)
+
+def rotate_vectors(vectors, angle_offsets):
+
+    theta_offset, phi_offset = angle_offsets
+
+    Rz = np.array([
+        [np.cos(theta_offset), -np.sin(theta_offset), 0],
+        [np.sin(theta_offset),  np.cos(theta_offset), 0],
+        [0, 0, 1]
+    ])
+
+    Ry = np.array([
+        [np.cos(phi_offset), 0, np.sin(phi_offset)],
+        [0, 1, 0],
+        [-np.sin(phi_offset), 0, np.cos(phi_offset)]
+    ])
+
+    R = Ry @ Rz
+
+    rotated_vectors = vectors @ R.T
+
+    return rotated_vectors
+
+
+def propagate(t, origin, Vg, cube, sensors, sensor_data, t_global, data_modes):
+    modes = data_modes["mode"]
+    n_reflect = np.zeros(len(origin), dtype=int)
+    t_sum = np.zeros(len(origin))
+    r = calcposition(t, origin, Vg, modes)
+    reflect = isreflecting(r, cube)
+    absorbed = np.zeros_like(reflect, dtype=bool)
+
+    while np.any(reflect[~absorbed]):
+        mask = reflect & ~absorbed
+        t_int, r_int, absorbed_new, which_sensor_absorbed = wall_intercept(cube, origin[mask], Vg[mask], sensors, modes[mask])
+        if len(which_sensor_absorbed) > 0:
+            sensor_data["t"].extend(t_int[absorbed_new] + t_global)
+            sensor_data["r"].extend(r_int[absorbed_new].tolist())
+            sensor_data["sensor"].extend(which_sensor_absorbed)
+
+        absorbed[mask] |= absorbed_new
+        mask = reflect & ~absorbed
+        t_sum[mask] += t_int[~absorbed_new]
+
+        r_new, Vg_new = calcposition_after_reflection(cube, r_int[~absorbed_new], t_sum[mask], t[mask], Vg[mask], modes[mask])
+        r[mask] = r_new
+        Vg[mask] = Vg_new
+        origin[mask] = r_int[~absorbed_new]
+        new_reflect = isreflecting(r[mask], cube)
+        reflect[mask] = new_reflect
+    return r, Vg, absorbed, sensor_data, data_modes
+
+######################### INITIALIZATION OF GROUP VELOCITIES ########################################################################
+
+phi = np.linspace(phi0, phi1, n_phi)
+theta = np.linspace(theta0, theta1, n_theta)
+dk = np.linspace(-0.001,0.001,N)
+
+VgxST=np.zeros((n_phi,n_theta))
+VgyST=np.zeros((n_phi,n_theta))
+VgzST=np.zeros((n_phi,n_theta))
+VgxFT=np.zeros((n_phi,n_theta))
+VgyFT=np.zeros((n_phi,n_theta))
+VgzFT=np.zeros((n_phi,n_theta))
+VgxL=np.zeros((n_phi,n_theta))
+VgyL=np.zeros((n_phi,n_theta))
+VgzL=np.zeros((n_phi,n_theta))
+
+
+# GROUP VELOCITIES ARE CALCULATED FOR EACH POINT IN THE GRID (phi,theta)
+for i in range(n_phi):
+    for j in range(n_theta):
+        kx=np.cos(phi[i]) * np.sin(theta[j])
+        ky=np.sin(phi[i]) * np.sin(theta[j])
+        kz=np.cos(theta[j])
+
+        # determine Vgx
+        kx_vary=kx+dk
+        omega_varyST, omega_varyFT, omega_varyL = np.vectorize(calcomega)(kx_vary,ky,kz)
+        VgxST[i,j]=np.gradient(omega_varyST,kx_vary)[N//2]
+        VgxFT[i,j]=np.gradient(omega_varyFT,kx_vary)[N//2]
+        VgxL[i,j]=np.gradient(omega_varyL,kx_vary)[N//2]
+
+        # determine Vgy
+        ky_vary=ky+dk
+        omega_varyST, omega_varyFT, omega_varyL = np.vectorize(calcomega)(kx,ky_vary,kz)
+        VgyST[i,j]=np.gradient(omega_varyST,ky_vary)[N//2]
+        VgyFT[i,j]=np.gradient(omega_varyFT,kx_vary)[N//2]
+        VgyL[i,j]=np.gradient(omega_varyL,kx_vary)[N//2]
+
+        # determine Vgz
+        kz_vary=kz+dk
+        omega_varyST, omega_varyFT, omega_varyL = np.vectorize(calcomega)(kx,ky,kz_vary)
+        VgzST[i,j]=np.gradient(omega_varyST,kz_vary)[N//2]
+        VgzFT[i,j]=np.gradient(omega_varyFT,kx_vary)[N//2]
+        VgzL[i,j]=np.gradient(omega_varyL,kx_vary)[N//2]
+    print(i)
+
+# INTERPOLATION OF GROUP VELOCITIES
+from scipy.interpolate import RectBivariateSpline
+
+Vgx_splineST = RectBivariateSpline(phi, theta, VgxST)
+Vgy_splineST = RectBivariateSpline(phi, theta, VgyST)
+Vgz_splineST = RectBivariateSpline(phi, theta, VgzST)
+
+Vgx_splineFT = RectBivariateSpline(phi, theta, VgxFT)
+Vgy_splineFT = RectBivariateSpline(phi, theta, VgyFT)
+Vgz_splineFT = RectBivariateSpline(phi, theta, VgzFT)
+
+Vgx_splineL = RectBivariateSpline(phi, theta, VgxL)
+Vgy_splineL = RectBivariateSpline(phi, theta, VgyL)
+Vgz_splineL = RectBivariateSpline(phi, theta, VgzL)
+
+
+########## Sound velocity approximation for frequency distribution #########################################
+
+phi_vals = np.linspace(phi.min(), phi.max(), num=100)
+theta_vals = np.linspace(theta.min(), theta.max(), num=100)
+
+p, t = np.meshgrid(phi_vals, theta_vals, indexing='ij')
+
+Vgx_vals = Vgx_splineST(p[:, 0], t[0, :])
+Vgy_vals = Vgy_splineST(p[:, 0], t[0, :])
+Vgz_vals = Vgz_splineST(p[:, 0], t[0, :])
+Vg_mag = np.sqrt(Vgx_vals**2 + Vgy_vals**2 + Vgz_vals**2)
+VgST_avg = np.mean(Vg_mag)  # average across rows (phi axis)
+
+Vgx_vals = Vgx_splineFT(p[:, 0], t[0, :])
+Vgy_vals = Vgy_splineFT(p[:, 0], t[0, :])
+Vgz_vals = Vgz_splineFT(p[:, 0], t[0, :])
+Vg_mag = np.sqrt(Vgx_vals**2 + Vgy_vals**2 + Vgz_vals**2)
+VgFT_avg = np.mean(Vg_mag)  # average across rows (phi axis)
+
+Vgx_vals = Vgx_splineL(p[:, 0], t[0, :])
+Vgy_vals = Vgy_splineL(p[:, 0], t[0, :])
+Vgz_vals = Vgz_splineL(p[:, 0], t[0, :])
+Vg_mag = np.sqrt(Vgx_vals**2 + Vgy_vals**2 + Vgz_vals**2)
+VgL_avg = np.mean(Vg_mag)  # average across rows (phi axis)
+
+
+v_sound = [VgST_avg,VgFT_avg,VgL_avg]
+
+################################################################################################################################################
+
+
+####################################################################################################################################################
+
+
+
+# SOME INITIALIZATION
+time_steps = np.linspace(time_start,time_end, num_frames)
+origin = np.ones((num_particles_, 3)) * np.array([originx,originy,originz])
+phi_values = np.linspace(phi0, phi1, num_particles_)
+theta_values = np.full(num_particles_, np.pi/2)             # Specific for theta = np.pi/2
+
+
+r_0_ = origin
+absorbed_ = np.zeros_like(phi_values, dtype=bool)
+delta_t = np.diff(np.insert(time_steps,0,0))
+
+k_0_ = np.array([np.cos(phi_values) * np.sin(theta_values),
+                np.sin(phi_values) * np.sin(theta_values),
+                np.cos(theta_values)]).T
+
+animated_values = []
+animated_stored_modes = []
+sensor_data = {
+    "t": [],
+    "r": [],
+    "sensor": [],
+    "mode": [],
+    "frequencies": []
+}
+
+
+
+
+
+
+
+############ FREQUENCY DISTRIBUTION AND MODE POPULATION ############################################################################
+mode_counts = (np.array(mode_percentages) * num_particles_).astype(int)
+
+mode_counts[1] += (num_particles_ - mode_counts.sum()) // (1/mode_percentages[1])
+mode_counts[2] += (num_particles_ - mode_counts.sum()) // (1/mode_percentages[2])
+mode_counts[0] += (num_particles_ - mode_counts.sum())
+
+modes = np.concatenate([
+    np.full(count, mode) for mode, count in enumerate(mode_counts)
+])
+
+
+
+frequencies = np.zeros(num_particles_)
+
+
+for mode, count in enumerate(mode_counts):
+    v_s = v_sound[mode]
+    N = count
+    hbar = const.hbar # J·s
+    kB = const.k # J/K
+    T = Temperature # Temperature in K
+    L = 0.05 # 5cm
+    C = L**3 * 3 / (2 * np.pi**2) / v_s**3
+    
+    def complicated_pdf(x):
+        return C * ( x * 2 * np.pi)**2 * 1 / (np.exp(x * 2*np.pi * hbar / (kB * T)) - 1) 
+
+    x = np.linspace(1E7, 1E12, 10000)
+    pdf_vals = complicated_pdf(x)
+
+    cdf_vals = integrate.cumulative_trapezoid(pdf_vals, x, initial=0)
+    cdf_vals /= cdf_vals[-1]
+    inverse_cdf = interpolate.interp1d(cdf_vals, x, kind='linear', bounds_error=False, fill_value=(x[0], x[-1]))
+
+    u = np.random.uniform(0, 1, N)
+    samples = inverse_cdf(u)
+
+    if mode == 0:
+        frequencies[:mode_counts[0]] = samples
+
+    elif mode == 1:
+        frequencies[mode_counts[0]:mode_counts[1] + mode_counts[0]] = samples
+
+    elif mode ==2:
+        frequencies[mode_counts[1] + mode_counts[0]:mode_counts[2] + mode_counts[1] + mode_counts[0]] = samples
+
+
+np.random.shuffle(modes)
+
+Vg_0_ = calcVg(k_0_, modes, angle_offsets)
+
+data_modes = {
+    "mode": modes,
+    "frequencies": frequencies
+}
+######################################################################################################
+
+
+
+
+
+################# COMPUTATION ################################################################################################
+
+t_global = 0
+
+for frame in (range(num_frames)):
+    dt = np.ones(num_particles_) * (delta_t[frame])
+    r_1, Vg_1, absorbed_new, sensor_data, data_modes = propagate(dt, r_0_, Vg_0_, cube, sensors, sensor_data, t_global, data_modes)
+    sensor_data["mode"].extend(data_modes["mode"][absorbed_new])
+    sensor_data["frequencies"].extend(data_modes["frequencies"][absorbed_new])
+    data_modes["mode"] = data_modes["mode"][~absorbed_new]
+    data_modes["frequencies"] = data_modes["frequencies"][~absorbed_new]
+    animated_stored_modes.append(data_modes["mode"])
+    absorbed_ |= absorbed_new
+    Vg_0_ = Vg_1[~absorbed_]
+    r_0_ = r_1[~absorbed_]
+    num_particles_ = np.sum(~absorbed_)
+    animated_values.append(r_1[:,:2][~absorbed_])
+    absorbed_ = absorbed_[~absorbed_]
+    t_global += delta_t[frame]
+    # if frame == 1:
+    #     colors = np.array(['blue', 'orange', 'green'])[animated_stored_modes[frame]]
+    #     plt.scatter(r_1[:,0][~absorbed_],r_1[:,1][~absorbed_], color=colors, s=10)
+    #     q=0.001
+    #     plt.xlim(-q, q)
+    #     plt.ylim(-q, q)
+    #     plt.axhline(-0.00084)
+    #     plt.axvline(-0.05)
+    #     plt.axhline(0.00084)
+    #     plt.axvline(0.05)
+    #     plt.grid()
+    #     plt.show()
+    # print(f"frame: {frame}")
+################################################################################################################################################
+# PLOT
+fig, ax = plt.subplots()
+q=0.051
+ax.set_xlim(-q, q)
+ax.set_ylim(-q, q)
+ax.axhline(-0.05)
+ax.axvline(-0.05)
+ax.axhline(0.05)
+ax.axvline(0.05)
+
+for sensor in sensors:
+    x_c, y_c, z_c, dx, dy, dz = sensor
+
+    if dx > 0:
+        ax.plot([x_c - dx / 2, x_c + dx / 2], [y_c, y_c], 'r-', linewidth=3, label="Sensor")
+    if dy > 0:
+        ax.plot([x_c, x_c], [y_c - dy / 2, y_c + dy / 2], 'r-', linewidth=3, label="Sensor")
+
+sc = ax.scatter([], [], s=10)
+
+def update(frame):
+    t = time_steps[frame]
+    num_particles_ = animated_values[frame].shape[0]
+    sc.set_offsets(animated_values[frame])
+    colors = np.array(['blue', 'orange', 'green'])[animated_stored_modes[frame]]
+    sc.set_color(colors)
+
+    ax.set_title(f"Time: {t:.2e} s, N: {num_particles_:.2e}")
+    ax.set_xlabel(f"x [cm]")
+    ax.set_ylabel(f"y [cm]")
+    print(f"{(frame)/num_frames * 100:.3} % complete")
+    return sc,
+
+ax.grid(True)
+ani = FuncAnimation(fig, update, frames=num_frames, interval=100, blit=True)
+ani.save("Animations/phonon_animation_14.gif")
+
+
+
+#############################################################################################################################################
+
+########### ONLY 1 SENSOR ####################################
+if len(sensors) == 1:
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    bin_count = 71
+
+    st_mask = np.array(sensor_data["mode"]) == 0
+    ft_mask = np.array(sensor_data["mode"]) == 1
+    l_mask = np.array(sensor_data["mode"]) == 2
+
+    filtered_times_st = np.array(sensor_data["t"])[st_mask]
+    filtered_times_ft = np.array(sensor_data["t"])[ft_mask]
+    filtered_times_l = np.array(sensor_data["t"])[l_mask]
+
+    filtered_frequency_st = np.array(sensor_data["frequencies"])[st_mask]
+    filtered_frequency_ft = np.array(sensor_data["frequencies"])[ft_mask]
+    filtered_frequency_l = np.array(sensor_data["frequencies"])[l_mask]
+
+    all_times = np.concatenate([filtered_times_st, filtered_times_ft, filtered_times_l])
+    all_frequency = np.concatenate([filtered_frequency_st, filtered_frequency_ft, filtered_frequency_l])
+    bin_counts, bin_edges = np.histogram(all_times , bins=50)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    plt.show()
+
+    bin_indices = np.digitize(all_times, bins=bin_edges) - 1
+
+    frequency_tot = np.zeros(len(np.unique(bin_indices)))
+    time_tot = np.zeros(len(np.unique(bin_indices)))
+
+    for i, unique in enumerate (np.unique(bin_indices)):
+        if unique == -1:
+            unique = 0
+        elif unique == len(bin_edges) - 1:
+            unique = len(bin_edges) - 2
+
+        frequency_tot[i] = np.sum(all_frequency[bin_indices==unique])
+        time_tot[i] = bin_centers[unique]
+        
+
+    fig, ax = plt.subplots(figsize=(6, 4)) 
+
+    # Plot ST
+    
+    ax.scatter(time_tot,frequency_tot)
+
+    # ax.hist(filtered_times_st, bins=bin_edges, color='red', alpha=0.6, label='ST Mode')
+
+    # Plot FT
+    # ax.hist(filtered_times_ft, bins=bin_edges, color='orange', alpha=0.6, label='FT Mode')
+
+    # Plot L
+    # ax.hist(filtered_times_l, bins=bin_edges, color='green', alpha=0.6, label='L Mode')
+
+    ax.set_xlabel('Time [s]')
+    ax.set_ylabel('Number of Absorptions')
+    ax.set_title("Time Profile for Single Sensor (ST, FT, and L Modes)")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+# SEPARATE PLOT OF EACH MODE
+    fig, ax = plt.subplots(3, 1, figsize=(6, 6), sharex=True)
+
+    ax[0].hist(filtered_times_st, bins=bin_edges, alpha=0.6, color='red', label='ST Mode')
+    ax[0].legend()
+
+    ax[1].hist(filtered_times_ft, bins=bin_edges, alpha=0.6, color='orange', label='FT Mode')
+    ax[1].legend()
+
+    ax[2].hist(filtered_times_l, bins=bin_edges, alpha=0.6, color='green', label='L Mode')
+    ax[2].legend()
+
+    ax[0].set_title("Time Profiles by Mode")
+    ax[2].set_xlabel('Time [s]')
+    ax[1].set_ylabel('Number of Absorptions')
+
+    plt.tight_layout()
+    ax[2].axvline(1.33E-5)
+    plt.show()
+
+# TOTAL TIME PROFILE
+    plt.hist(all_times, bins=bin_edges, alpha=0.6, color='blue', label='All Modes')
+    plt.title("Total Time Profile (All Modes)")
+    plt.xlabel('Time [s]')
+    plt.ylabel('Number of Absorptions')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+
+########### More than 1 SENSOR ####################################
+elif len(sensors) > 1:
+    import numpy as np
+    import matplotlib.pyplot as plt
+    bin_count=40
+    st_mask = np.array(sensor_data["mode"]) == 0
+    ft_mask = np.array(sensor_data["mode"]) == 1
+    l_mask = np.array(sensor_data["mode"]) == 2
+
+    filtered_times_st = np.array(sensor_data["t"])[st_mask]
+    filtered_sensors_st = np.array(sensor_data["sensor"])[st_mask]
+
+    filtered_times_ft = np.array(sensor_data["t"])[ft_mask]
+    filtered_sensors_ft = np.array(sensor_data["sensor"])[ft_mask]
+
+    filtered_times_l = np.array(sensor_data["t"])[l_mask]
+    filtered_sensors_l = np.array(sensor_data["sensor"])[l_mask]
+
+    unique_sensors_st = np.unique(filtered_sensors_st)
+    clist = ["red", "blue", "green", "pink", "lightblue", "purple"]
+
+    sensor_groups_st = {s: filtered_times_st[filtered_sensors_st == s] for s in unique_sensors_st}
+    sensor_groups_ft = {s: filtered_times_ft[filtered_sensors_ft == s] for s in np.unique(filtered_sensors_ft)}
+    sensor_groups_l = {s: filtered_times_l[filtered_sensors_l == s] for s in np.unique(filtered_sensors_l)}
+
+    fig, ax = plt.subplots(len(unique_sensors_st), 1, figsize=(6, 6))
+
+    all_times = np.concatenate([filtered_times_st, filtered_times_ft, filtered_times_l])
+    bin_edges = np.linspace(np.min(all_times), np.max(all_times), bin_count)
+
+    for i, s in enumerate(unique_sensors_st):
+        c_st = clist[i % len(clist)]
+        subset_st = sensor_groups_st[s]
+        ax[i].hist(subset_st, bins=bin_edges, color='red', alpha=0.6, label=f"Sensor {s}, ST")
+
+
+        if s in sensor_groups_ft:
+            c_ft = 'orange'
+            subset_ft = sensor_groups_ft[s]
+            ax[i].hist(subset_ft, bins=bin_edges, color=c_ft, alpha=0.6, label=f"Sensor {s}, FT")
+
+
+        if s in sensor_groups_l:
+            c_l = 'green'
+            subset_l = sensor_groups_l[s]
+            ax[i].hist(subset_l, bins=bin_edges, color=c_l, alpha=0.6, label=f"Sensor {s}, L")
+
+        ax[i].legend()
+        ax[i].set_ylabel('Number of Absorptions')
+
+    ax[-1].set_xlabel('Time [s]')
+    ax[0].set_title("Time Profiles of Each Sensor (ST, FT, and L Modes)")
+    plt.tight_layout()
+    plt.show()
+
+    fig, ax = plt.subplots(3, 1, figsize=(6, 6))
+    ax[0].hist(filtered_times_st, bins=bin_edges, alpha=0.6, color='red', label='ST Mode')
+    ax[0].legend()
+    ax[1].hist(filtered_times_ft, bins=bin_edges, alpha=0.6, color='yellow', label='FT Mode')
+    ax[1].legend()
+    ax[2].hist(filtered_times_l, bins=bin_edges, alpha=0.6, color='green', label='L Mode')
+    ax[2].legend()
+    ax[0].set_title("Time Profiles (ST, FT, and L Modes)")
+    ax[2].set_xlabel('Time [s]')
+    ax[1].set_ylabel('Number of Absorptions')
+    plt.tight_layout()
+    plt.show()
+
+    plt.hist(all_times, bins=bin_edges, alpha=0.6, color='red')
+    plt.title("Total Time Profile (ST, FT, and L Modes)")
+    plt.xlabel('Time [s]')
+    plt.ylabel('Number of Absorptions')
+    plt.legend()
+    plt.show()
